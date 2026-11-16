@@ -32,7 +32,7 @@ const C_AT = 64;
 const C_LB = 91;
 const C_BS = 92;
 const C_RB = 93;
-const C_UNDER = 95;
+const C_UNDERER = 95;
 const C_BT = 96;
 const C_PIPE = 124;
 const C_TILDE = 126;
@@ -523,7 +523,7 @@ function isRule(v) {
   let i = v.cs;
   if (i >= s.length) return false;
   const ch = s.charCodeAt(i);
-  if (ch !== C_MINUS && ch !== C_UNDER && ch !== C_STAR) return false;
+  if (ch !== C_MINUS && ch !== C_UNDERER && ch !== C_STAR) return false;
   let count = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i);
@@ -1563,7 +1563,7 @@ function delimRun(text, i) {
   const rightFlanking = !beforeWs && (!beforePunct || afterWs || afterPunct);
   let open = false;
   let close = false;
-  if (c === C_UNDER) {
+  if (c === C_UNDERER) {
     open = leftFlanking && (!rightFlanking || beforePunct);
     close = rightFlanking && (!leftFlanking || afterPunct);
   } else {
@@ -1602,6 +1602,106 @@ function codeSpan(text, i) {
     }
   }
   return null;
+}
+
+// Find the ']' that closes the link label starting just after '['
+// (labelStart is the index just after the opening bracket). Skips
+// escapes, nested brackets, and lenient code spans (`+ [^`]*? `+ — any
+// closing run length, marked's label regex). Returns the index of ']'
+// or -1 when the label cannot close (a bare backtick with no closing
+// run, or unbalanced brackets).
+function findLabelClose(text, labelStart) {
+  const n = text.length;
+  let depth = 1;
+  let i = labelStart;
+  while (i < n) {
+    const c = text.charCodeAt(i);
+    if (c === C_BS) { i += 2; continue; }
+    if (c === C_BT) {
+      let j = i;
+      while (j < n && text.charCodeAt(j) === C_BT) j++;
+      if (j === n) return -1;
+      let k = j;
+      while (k < n && text.charCodeAt(k) !== C_BT) k++;
+      if (k === n) return -1;
+      let m = k;
+      while (m < n && text.charCodeAt(m) === C_BT) m++;
+      i = m;
+      continue;
+    }
+    if (c === C_LB) { depth++; i++; continue; }
+    if (c === C_RB) {
+      depth--;
+      if (depth === 0) return i;
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return -1;
+}
+
+// The end (index just past the closing run) of a lenient code span
+// starting at i (text[i] === '`'): an opening run, non-backtick content,
+// and a closing run of ANY length, all ending at or before `limit`
+// (the label's ']'). Returns -1 when there is no closing run in range.
+// This is marked's label-regex code-span alternative
+// (`+(?!`)[^`]*?`+(?!`)); it lets a label like '``url`' (2 open, 1 close)
+// scan as one span so the ']' after it closes the label.
+function lenientSpanEnd(text, i, limit) {
+  const n = text.length;
+  let j = i;
+  while (j < n && text.charCodeAt(j) === C_BT) j++;
+  if (j >= limit) return -1;
+  let k = j;
+  while (k < limit && text.charCodeAt(k) !== C_BT) k++;
+  if (k >= limit) return -1;
+  let m = k;
+  while (m < limit && text.charCodeAt(m) === C_BT) m++;
+  return m;
+}
+
+// Would the bracket whose label closes at closeIdx form a link? Mirrors
+// tryLink's destination/reference logic (without the contains-a-link
+// check, which needs the parsed segments). Used to decide whether a
+// backtick span inside the label is label content (literal) or may form
+// a code span that extends past the ']'.
+function linkAfterLabel(text, closeIdx, labelText, ctx) {
+  const n = text.length;
+  let p = closeIdx + 1;
+  if (text.charCodeAt(p) === C_LP) {
+    let q = p + 1;
+    while (q < n && (text.charCodeAt(q) === C_SP || text.charCodeAt(q) === C_TAB || text.charCodeAt(q) === C_LF)) q++;
+    if (q < n) {
+      if (text.charCodeAt(q) === C_RP) return true;
+      const ld = linkDest(text, q);
+      if (ld) {
+        let r = ld.end;
+        while (r < n && (text.charCodeAt(r) === C_SP || text.charCodeAt(r) === C_TAB || text.charCodeAt(r) === C_LF)) r++;
+        if (text.charCodeAt(r) === C_RP) return true;
+      }
+    }
+    // Inline failed: falls back to a shortcut reference (cm-568).
+  }
+  let label = null;
+  if (text.charCodeAt(p) === C_LB) {
+    let depth = 1;
+    let r = p + 1;
+    while (r < n) {
+      const c = text.charCodeAt(r);
+      if (c === C_BS) { r += 2; continue; }
+      if (c === C_LB) return false;
+      if (c === C_RB) { depth--; if (depth === 0) break; r++; continue; }
+      r++;
+    }
+    if (depth !== 0) return false;
+    label = text.slice(p + 1, r);
+    if (label === '') label = labelText;
+  } else {
+    label = labelText;
+  }
+  if (label === null || label === undefined) return false;
+  return ctx.refs.has(normLabel(label));
 }
 
 // A raw HTML tag scanner: returns the index just past the tag, or -1.
@@ -1770,7 +1870,40 @@ function inlineParse(text, ctx) {
   // Bracket stack: { segIdx, srcPos, labelText, image, active }
   const brackets = [];
   // Regions masked from the emphasis scan (see maskedLinkRegions).
-  const maskedRegions = maskedLinkRegions(text);
+  const maskedRegions = maskedLinkRegions(text).concat(maskedBogusCodeRegions(text));
+  // Valid inline links, hidden from the emphasis scan-forward ONLY
+  // (doc-40). Marked's emStrong masking (#n/blockSkip) hides EVERY
+  // link from the scan, so an outer opener must not see delimiters
+  // inside a link label. maskedRegions only covers links whose label
+  // is invalid unmasked; a valid link's delimiters rely on linkDead,
+  // which misses delimiters that paired BEFORE the link formed (the
+  // inner '*be*' pairs first, so its opener is never marked linkDead
+  // and the outer scan counts it and fails). Kept separate from
+  // maskedRegions on purpose: processEmphasis's inMasked block must
+  // NOT apply to valid links, or the inner pairing inside the label
+  // could never form.
+  const scanHiddenRegions = maskedRegions.concat(validInlineLinkRegions(text));
+  // Per-bracket label info (memoized): { close, willLink } for the
+  // innermost active bracket, used by the code-span handler to bound
+  // code spans to the label and to recognise lenient backtick spans.
+  const labelInfoMap = new Map();
+  function labelInfoFor(b) {
+    let info = labelInfoMap.get(b.srcPos);
+    if (info === undefined) {
+      const labelStart = b.srcPos + (b.image ? 2 : 1);
+      const close = findLabelClose(text, labelStart);
+      let willLink = false;
+      if (close !== -1) {
+        const labelText = text.slice(labelStart, close);
+        if (validLabelText(labelText)) {
+          willLink = linkAfterLabel(text, close, labelText, ctx);
+        }
+      }
+      info = { close, willLink };
+      labelInfoMap.set(b.srcPos, info);
+    }
+    return info;
+  }
   let inRaw = null; // 'pre' | 'code' | 'kbd' | 'script' | null
   const n = text.length;
   let i = 0;
@@ -1795,12 +1928,34 @@ function inlineParse(text, ctx) {
 
   // Wrap segments [o.pos, d.pos] into an em/strong/del node. The opener's and
   // closer's remaining runs stay as literal delim segments around the node.
-  function wrapEmphasis(o, d, use) {
+  // `b` is the scan's adjusted closer run (null when no scan ran): the node
+  // consumes b asterisks of the closer (use as the delimiter, b-use as
+  // literal text inside the node); only (d.run - b) stays outside. When
+  // the opener is fully consumed (oRem === 0) the inside part cannot
+  // re-pair, so it goes inside (doc-30: '**by command *tool*one***'
+  // keeps the '*' inside the <strong>). Otherwise the remainder stays
+  // outside, where it may re-pair with the opener's remainder
+  // ('***foo***' -> <em><strong>foo</strong></em>).
+  function wrapEmphasis(o, d, use, b) {
     const oPos = o.pos;
     const dPos = d.pos;
     const oRem = o.run - use;
-    const dRem = d.run - use;
+    // `b` is the adjusted closer run against the ORIGINAL run (marked
+    // scans the static text). The closer may already have lost
+    // (origRun - run) asterisks to an inner pairing; those are part of
+    // `b`, not literal text inside this node (cm-431: the inner '*bar*'
+    // spent 1 of the '***' run, so the strong's inside count is 0,
+    // not 1). `oRem === 0` stays: when the opener has a remainder the
+    // extra closer asterisks go outside (to pair with it later).
+    let inside = 0;
+    if (b !== null && b !== undefined && oRem === 0 && b > use) {
+      inside = Math.max(0, b - use - (d.origRun - d.run));
+    }
+    const dRem = d.run - use - inside;
     const children = segs.slice(oPos + 1, dPos);
+    if (inside > 0) {
+      children.push({ t: 'text', s: (d.ch === C_TILDE ? '~' : d.ch === C_STAR ? '*' : '_').repeat(inside), inLink: ctx.inLink });
+    }
     const node = {
       t: d.ch === C_TILDE ? 'del' : use === 2 ? 'strong' : 'em',
       children,
@@ -1834,6 +1989,27 @@ function inlineParse(text, ctx) {
       if (dd.pos > oPos && dd.pos < dPos) dd.active = false;
       else if (dd.pos > dPos) dd.pos -= delta;
     }
+    // Record, for every delimiter inside this node's source range, which
+    // char contains it. Marked's RDelim alt1 shields a delimiter inside
+    // an opposite-char DOUBLE run only ('__...*...__' is invisible to
+    // the '*' scan, cm-470; a '*' inside a single '_..._' em still
+    // counts), so flags are set only for a strong (use 2) whose opener
+    // run is exactly 2 in the source. A '*' inside '**...**' still
+    // counts (doc-03). Flags accumulate (a delim inside both keeps
+    // both); srcPos is stable across splices, so this also covers
+    // already-inactive delims in nested nodes. The node's own
+    // delimiters are excluded by the strict inequality (they sit
+    // exactly at o.srcPos / d.srcPos).
+    const nodeCh = d.ch;
+    if ((nodeCh === C_STAR || nodeCh === C_UNDERER) && use === 2 && o.origRun === 2) {
+      for (const dd of delims) {
+        if (dd === o || dd === d) continue;
+        if (dd.srcPos > o.srcPos && dd.srcPos < d.srcPos) {
+          if (nodeCh === C_STAR) dd.inStar = true;
+          else dd.inUnd = true;
+        }
+      }
+    }
     // Brackets inside the wrapped range are now nested inside the em/strong
     // node and can no longer form a link at the top level; brackets after
     // the range shift by the splice delta (cm-474: a stale segIdx made
@@ -1846,19 +2022,106 @@ function inlineParse(text, ctx) {
     }
   }
 
+  // Marked's emStrong scan-forward, over the delimiter list: from opener
+  // `o` (at delims[oIdx]) with effective run `effRun`, walk the same-char
+  // delimiter runs up to (and including) the closer at delims[dIdx],
+  // accumulating the opener count `m` exactly as marked's
+  // emStrongRDelim loop does — open-only runs add to m, both-flanking
+  // runs are rule-of-3 checked (skipped into f when the opener run and
+  // the run sum to a multiple of 3), close runs subtract from m. Returns
+  // the adjusted closer run `b` when the scan terminates at delims[dIdx]
+  // (so `o` pairs with it), else null. `y` is the opener's FULL run
+  // (origRun): marked's walk-back counts a preceding same-char run, so
+  // a retried (shortened) opener still has y = the original run.
+  // Delimiters inside a formed link (linkDead) are invisible to the scan
+  // (marked's masking hides the whole link), as are delimiters inside a
+  // masked region the opener is not in. Runs are the original runs
+  // (origRun) — marked scans the static masked text, so a run that was
+  // already partly consumed still counts in full, including the closer
+  // being processed (cm-431: the '***' remainder must count as 3 in the
+  // m-accounting, so the '**' opener's scan terminates at it) — with
+  // two exceptions, applied in the loop: a delimiter shielded inside
+  // an opposite-char node (inUnd/inStar, marked's RDelim alt1, cm-470)
+  // is invisible, and when the opener is itself a remainder
+  // (o.run < o.origRun) an already-paired inner delimiter counts only
+  // by its current (usually 0) run, or the leftover opener's scan
+  // terminates at the inner closer that already spent its run
+  // (cm-408/413/426/431).
+  function scanFrom(o, oIdx, dIdx, effRun) {
+    const d = delims[dIdx];
+    const y = o.origRun;
+    let m = effRun;
+    let f = 0;
+    const prevCh = o.srcPos > 0 ? text[o.srcPos - 1] : '';
+    const nextCh = o.srcPos + o.origRun < n ? text[o.srcPos + o.origRun] : '';
+    const prevIsWs = prevCh === '' || isWsCh(prevCh);
+    const prevIsPunct = prevCh !== '' && isPunctCh(prevCh);
+    const nextIsPunct = nextCh !== '' && isPunctCh(nextCh);
+    const R = !prevIsWs && (nextIsPunct || (o.ch === C_STAR && !prevIsPunct));
+    const isRemainder = o.run < o.origRun;
+    for (let k = oIdx + 1; k <= dIdx; k++) {
+      const x = delims[k];
+      if (x.ch !== o.ch || x.linkDead) continue;
+      let hidden = false;
+      for (const rg of scanHiddenRegions) {
+        if (x.srcPos >= rg[0] && x.srcPos < rg[1] && !(o.srcPos >= rg[0] && o.srcPos < rg[1])) { hidden = true; break; }
+      }
+      if (hidden) continue;
+      if (!x.active) {
+        if (o.ch === C_STAR && x.inUnd) continue;
+        if (o.ch === C_UNDERER && x.inStar) continue;
+      }
+      let run;
+      if (k === dIdx) run = d.origRun;
+      else if (!x.active && isRemainder) run = x.run;
+      else run = x.origRun;
+      if (run <= 0) continue;
+      if (x.open && !x.close) { m += run; continue; }
+      if ((x.open && x.close) || R) {
+        if (y % 3 !== 0 && (y + run) % 3 === 0) { f += run; continue; }
+      }
+      m -= run;
+      if (m > 0) continue;
+      if (k === dIdx) return Math.min(run, run + m + f);
+      return null;
+    }
+    return null;
+  }
+
   // Process a closer delimiter: repeatedly find the nearest matching opener
   // (scanning backwards), wrap, and re-scan from the beginning while the
   // closer still has a run.
+  // Process a closer delimiter: repeatedly find a matching opener, wrap,
+  // and re-scan while the closer still has a run.
   function processEmphasis(dIdx) {
     const d = delims[dIdx];
     while (d.active && d.run > 0 && d.close) {
-      let oIdx = -1;
+      // Collect every candidate opener whose scan succeeds (nearest-first
+      // order). Usually there is one; when several succeed at the same
+      // closer, the pick rule below decides.
+      const cands = [];
       for (let k = dIdx - 1; k >= 0; k--) {
         const o = delims[k];
         if (!o.active || o.run === 0 || !o.open || o.ch !== d.ch) continue;
-        // The odd-match rule of 3 (for * and _ only).
-        if (d.ch !== C_TILDE && (o.open && o.close || d.open && d.close)) {
-          if ((o.run + d.run) % 3 === 0 && o.run % 3 !== 0) continue;
+        // Marked's scan-forward (for * and _): the opener pairs with this
+        // closer only if its forward scan terminates here. This is what
+        // stops '*first changes **code**request*' from pairing (the inner
+        // '**' opener adds to m, the inner '**' closer is rule-of-3
+        // skipped, so the final '*' cannot close the outer '*').
+        // When the scan fails, marked retries with the run shortened by
+        // one (its text rule consumes one delimiter as literal text and
+        // re-tries the rest as a new opener), so try effective runs from
+        // o.run down to 1 ('***foo**' pairs the last '**' as <strong>,
+        // leaving one '*' literal). '~' keeps the old nearest-opener
+        // rule (del has no scan-forward in marked).
+        let scanB = null;
+        let scanEff = 0;
+        if (d.ch !== C_TILDE) {
+          for (let eff = o.run; eff >= 1; eff--) {
+            const b = scanFrom(o, k, dIdx, eff);
+            if (b !== null) { scanB = b; scanEff = eff; break; }
+          }
+          if (scanB === null) continue;
         }
         // Link precedence: if the closer is inside an unclosed bracket
         // and the opener is before that bracket, the opener must NOT pair
@@ -1901,13 +2164,42 @@ function inlineParse(text, ctx) {
           if (o.srcPos >= rg[0] && o.srcPos < rg[1] && d.srcPos >= rg[0] && d.srcPos < rg[1]) { inMasked = true; break; }
         }
         if (inMasked) continue;
-        oIdx = k;
-        break;
+        // The use count is based on the EFFECTIVE opener run (the shortened
+        // run that paired), not the original run. `full` marks a success
+        // at the opener's full run; a success only via a shortened retry
+        // is weaker (see pick rule below).
+        const effRun = scanEff > 0 ? scanEff : o.run;
+        const use = effRun >= 2 && d.run >= 2 ? 2 : 1;
+        cands.push({ o, scanB, use, full: d.ch === C_TILDE || scanEff === o.run });
+        // '~' takes the nearest opener only (no scan, no multi-candidate).
+        if (d.ch === C_TILDE) break;
       }
-      if (oIdx === -1) break;
-      const o = delims[oIdx];
-      const use = o.run >= 2 && d.run >= 2 ? 2 : 1;
-      wrapEmphasis(o, d, use);
+      if (cands.length === 0) break;
+      // Pick rule. (1) Prefer candidates that succeed at the FULL run
+      // over those that only succeed via a shortened retry: a retry
+      // success is spurious when the full-run scan would find a later
+      // closer (doc-26: the outer '**' "succeeds" at the inner '*' only
+      // via eff=1, but its real pairing is the later '**' as strong;
+      // the inner '*' succeeds at its full run and must pair first).
+      // (2) Among full-run successes, nearest by default — the inner
+      // pair forms first and the outer pairs with the closer's remainder
+      // via the while loop (cm-409/414/431: inner use + outer use fits
+      // the closer's run). But when the nearest and the farthest both
+      // succeed and their uses together exceed the closer's original
+      // run, they cannot both pair — the outer (farthest, which marked
+      // tries first) wins (doc-11: outer '**' strong needs 2, inner '*'
+      // em needs 1, closer run is 2, 1+2=3>2, so the outer strong pairs
+      // and the inner '*' stays literal). (3) If only retries succeed,
+      // take the nearest.
+      let pool = cands.filter(c => c.full);
+      if (pool.length === 0) pool = cands;
+      let pick = pool[0];
+      if (pool.length >= 2) {
+        const near = pool[0];
+        const far = pool[pool.length - 1];
+        if (near.use + far.use > d.origRun) pick = far;
+      }
+      wrapEmphasis(pick.o, d, pick.use, pick.scanB);
     }
   }
 
@@ -2035,6 +2327,107 @@ function inlineParse(text, ctx) {
   // delimiters inside such a region cannot pair (doc-16/20/23: '[at
   // _node `` a ` b ``_](...)' — the '_..._' stays literal, only the code
   // span and the autolinked URL render).
+  // Bogus code-span regions from marked's #n masking (doc-09/16/28/35):
+  // when a link's label contains an UNBALANCED backtick code span (its
+  // backtick runs cannot pair into valid code spans, e.g. `` ``url` ``
+  // with 2 opening and 1 closing backtick), the blockSkip `link` pattern
+  // fails (its code-span alternative needs equal opening/closing runs).
+  // The anyPunctuationOutsideCode + blockSkip passes then match a code
+  // span from a backtick run in the label to the next backtick run of the
+  // same length after the link, hiding the emphasis delimiters inside it
+  // (the `__issues most__` / `_issue table_` stays literal in marked).
+  // Replicate by adding that span as a masked region. The leftmost label
+  // run that yields a match wins (blockSkip scans left to right).
+  function maskedBogusCodeRegions(text) {
+    const regions = [];
+    const n = text.length;
+    let i = 0;
+    while (i < n) {
+      if (text.charCodeAt(i) !== C_LB) { i++; continue; }
+      // Find the closing ']' by bracket depth only. Do NOT skip code
+      // spans the way maskedLinkRegions does: the whole point here is
+      // that the label's code span is UNBALANCED, so a balanced-span
+      // skip never finds the ']' and the link is missed entirely.
+      let depth = 1;
+      let j = i + 1;
+      let close = -1;
+      while (j < n) {
+        const c = text.charCodeAt(j);
+        if (c === C_BS) { j += 2; continue; }
+        if (c === C_LB) depth++;
+        else if (c === C_RB) { depth--; if (depth === 0) { close = j; break; } }
+        j++;
+      }
+      if (close === -1) { i++; continue; }
+      // A '(' destination right after ']'?
+      let p = close + 1;
+      if (text.charCodeAt(p) !== C_LP) { i++; continue; }
+      let q = p + 1;
+      while (q < n && (text.charCodeAt(q) === C_SP || text.charCodeAt(q) === C_TAB || text.charCodeAt(q) === C_LF)) q++;
+      let end = -1;
+      if (q < n) {
+        if (text.charCodeAt(q) === C_RP) end = q + 1;
+        else {
+          const ld = linkDest(text, q);
+          if (ld) {
+            let r = ld.end;
+            while (r < n && (text.charCodeAt(r) === C_SP || text.charCodeAt(r) === C_TAB || text.charCodeAt(r) === C_LF)) r++;
+            if (text.charCodeAt(r) === C_RP) end = r + 1;
+          }
+        }
+      }
+      if (end === -1) { i++; continue; }
+      // Backtick runs in the label.
+      const runs = [];
+      let k = i + 1;
+      while (k < close) {
+        if (text.charCodeAt(k) === C_BT) {
+          let m = k;
+          while (m < close && text.charCodeAt(m) === C_BT) m++;
+          runs.push([k, m - k]);
+          k = m;
+        } else k++;
+      }
+      // Is the label unbalanced (its runs cannot pair into valid code
+      // spans)? A run pairs with the NEXT run of the same length; runs
+      // in between are the code span's content (the Ot pass flattens
+      // them to '+'), not separate spans. E.g. `` `` a ` b `` `` is
+      // balanced (2 pairs with 2, the single backtick is content), while
+      // `` ``small` `` is not (2 has no later 2 to pair with).
+      let unbalanced = false;
+      {
+        let a = 0;
+        while (a < runs.length) {
+          let paired = false;
+          for (let b = a + 1; b < runs.length; b++) {
+            if (runs[b][1] === runs[a][1]) { a = b + 1; paired = true; break; }
+          }
+          if (!paired) { unbalanced = true; break; }
+        }
+      }
+      if (unbalanced && runs.length > 0) {
+        // Try each label run left to right as the bogus opening; the
+        // first that finds a same-length closing run after the link wins.
+        for (const [pRun, lenRun] of runs) {
+          if (pRun + lenRun >= n || text.charCodeAt(pRun + lenRun) === C_BT) continue;
+          let s = end;
+          let foundQ = -1;
+          while (s < n) {
+            if (text.charCodeAt(s) === C_BT) {
+              let m = s;
+              while (m < n && text.charCodeAt(m) === C_BT) m++;
+              if (m - s === lenRun && s > 0 && text.charCodeAt(s - 1) !== C_BT) { foundQ = s; break; }
+              s = m;
+            } else s++;
+          }
+          if (foundQ !== -1) { regions.push([pRun, foundQ + lenRun]); break; }
+        }
+      }
+      i = end;
+    }
+    return regions;
+  }
+
   function maskedLinkRegions(text) {
     const regions = [];
     const n = text.length;
@@ -2090,6 +2483,77 @@ function inlineParse(text, ctx) {
         }
       }
       if (end !== -1 && !validLabelText(label) && validLabelTextMasked(label)) {
+        regions.push([i, end]);
+        i = end;
+        continue;
+      }
+      i++;
+    }
+    return regions;
+  }
+
+  // Regions of VALID inline links '[label](dest)', for the emphasis
+  // scan-forward ONLY (doc-40). Same enumeration as maskedLinkRegions
+  // (find ']' skipping escapes/code spans/nested brackets, then a
+  // '(' destination), but the condition is a VALID label — a link
+  // that will form. Marked's #n masking hides every link from the
+  // emStrong scan, valid or not; our scan must do the same, or an
+  // outer opener counts the label's already-paired delimiters.
+  function validInlineLinkRegions(text) {
+    const regions = [];
+    const n = text.length;
+    let i = 0;
+    while (i < n) {
+      if (text.charCodeAt(i) !== C_LB) { i++; continue; }
+      // Find the closing ']' (skip escapes, code spans, nested brackets).
+      let depth = 1;
+      let j = i + 1;
+      let close = -1;
+      while (j < n) {
+        const c = text.charCodeAt(j);
+        if (c === C_BS) { j += 2; continue; }
+        if (c === C_BT) {
+          let k = j;
+          while (k < n && text.charCodeAt(k) === C_BT) k++;
+          const run = k - j;
+          let m = k;
+          let found = -1;
+          while (m < n) {
+            if (text.charCodeAt(m) === C_BT) {
+              let q = m;
+              while (q < n && text.charCodeAt(q) === C_BT) q++;
+              if (q - m === run) { found = q; break; }
+              m = q;
+            } else m++;
+          }
+          if (found === -1) { j = n; break; }
+          j = found;
+          continue;
+        }
+        if (c === C_LB) depth++;
+        else if (c === C_RB) { depth--; if (depth === 0) { close = j; break; } }
+        j++;
+      }
+      if (close === -1) { i++; continue; }
+      const label = text.slice(i + 1, close);
+      // A '(' destination right after ']'?
+      let p = close + 1;
+      if (text.charCodeAt(p) !== C_LP) { i++; continue; }
+      let q = p + 1;
+      while (q < n && (text.charCodeAt(q) === C_SP || text.charCodeAt(q) === C_TAB || text.charCodeAt(q) === C_LF)) q++;
+      let end = -1;
+      if (q < n) {
+        if (text.charCodeAt(q) === C_RP) end = q + 1;
+        else {
+          const ld = linkDest(text, q);
+          if (ld) {
+            let r = ld.end;
+            while (r < n && (text.charCodeAt(r) === C_SP || text.charCodeAt(r) === C_TAB || text.charCodeAt(r) === C_LF)) r++;
+            if (text.charCodeAt(r) === C_RP) end = r + 1;
+          }
+        }
+      }
+      if (end !== -1 && validLabelText(label)) {
         regions.push([i, end]);
         i = end;
         continue;
@@ -2188,9 +2652,11 @@ function inlineParse(text, ctx) {
     // applies to links only. Return -1 so the caller pops this bracket
     // and treats the ']' as literal text.
     if (!b.image && containsLink(children)) return -1;
-    // Delimiters inside the link/image text are no longer usable.
+    // Delimiters inside the link/image text are no longer usable. They
+    // are also invisible to the emphasis scan-forward (linkDead):
+    // marked's emStrong masking hides the whole link from the scan.
     for (const dd of delims) {
-      if (dd.active && dd.pos > b.segIdx && dd.pos < oldLen) dd.active = false;
+      if (dd.active && dd.pos > b.segIdx && dd.pos < oldLen) { dd.active = false; dd.linkDead = true; }
     }
     // A link's text may not contain a link: forming a link deactivates
     // only the brackets at/inside it (the opening bracket itself and any
@@ -2276,12 +2742,32 @@ function inlineParse(text, ctx) {
     // --- code span ---
     if (c === C_BT) {
       const cs = codeSpan(text, i);
-      if (cs) {
+      // Inside a link label, a code span must not extend past the label's
+      // ']' (marked's label regex bounds the code-span alternative to the
+      // label). When the label will form a link, a lenient span
+      // (`+ [^`]*? `+, any closing length) is label content, not a code
+      // span (doc-09/16/28/35: '[docs each ``url`](...)' — the '``url`'
+      // is literal label text; the code span must not swallow the ']'
+      // and the destination).
+      let bInfo = null;
+      for (let k = brackets.length - 1; k >= 0; k--) {
+        if (brackets[k].active) { bInfo = labelInfoFor(brackets[k]); break; }
+      }
+      if (cs && (!bInfo || bInfo.close === -1 || cs.end <= bInfo.close)) {
         flushText(i);
         segs.push({ t: 'code', s: cs.content });
         i = cs.end;
         textStart = i;
         continue;
+      }
+      if (bInfo && bInfo.close !== -1 && bInfo.willLink) {
+        const spanEnd = lenientSpanEnd(text, i, bInfo.close);
+        if (spanEnd !== -1) {
+          // Literal label text: advance past the whole span (the
+          // backticks stay in the pending text run).
+          i = spanEnd;
+          continue;
+        }
       }
       // No closing run of the same length: the WHOLE opening run is
       // literal text. Advance past all of it, so a double backtick is not
@@ -2291,7 +2777,7 @@ function inlineParse(text, ctx) {
       continue;
     }
     // --- emphasis delimiters ---
-    if (c === C_STAR || c === C_UNDER || c === C_TILDE) {
+    if (c === C_STAR || c === C_UNDERER || c === C_TILDE) {
       const r = delimRun(text, i);
       if (c === C_TILDE && r.run > 2) {
         // Runs of 3+ tildes are literal.
@@ -2314,6 +2800,7 @@ function inlineParse(text, ctx) {
         seg,
         pos: segs.length - 1,
         run: r.run,
+        origRun: r.run,
         open: r.open,
         close: r.close,
         active: true,
@@ -2458,38 +2945,25 @@ const WWW_RE = /^(www\.)(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/;
 const SCHEME_RE = /^([a-zA-Z][a-zA-Z0-9+.-]{1,31}):[^\s<]*/;
 const EMAIL_RE = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+/;
 
-function trailPunct(ch) {
-  return ch === '?' || ch === '!' || ch === '.' || ch === ',' || ch === ':' || ch === ';' || ch === '*' || ch === '_' || ch === '~' || ch === "'" || ch === '"' || ch === '(';
-}
-
-// Marked's _backpedal, applied until stable: strip trailing punctuation
-// ('?' '!' '.' ',' ':' ';' '*' '_' '~' "'" '"' '(') and a trailing ')'
-// ONLY when it is not the close of a balanced '(...)' group (the group
-// '\([^)]*\)' is kept whole). A trailing '&...;' that looks like an entity
-// reference is not part of the autolink either.
+// Marked's _backpedal (url rule): match the longest valid prefix of the
+// candidate URL — plain runs, balanced '(...)' groups, a lone '&' (not the
+// start of an '&...;' entity reference running to the end), and trailing
+// punctuation that is NOT at the end of the string. It stops before an
+// unbalanced '(' (doc-08: 'https://sub.domain.example.io)](https://...'
+// backpedals to '...)]', so the '(https://...)' after it links separately).
+// A single application suffices (marked loops only to confirm stability).
+const BACKPEDAL_RE = /^(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 function trimAutoEnd(s) {
-  let end = s.length;
-  // A trailing '&...;' that looks like an entity reference is not part of
-  // the autolink (gfm-627: 'www.google.com/search?q=commonmark&hl;' links
-  // only up to 'commonmark'; '&hl;' stays literal).
-  const amp = s.lastIndexOf('&', end - 1);
-  if (amp >= 0) {
-    const tail = s.slice(amp + 1, end);
-    if (/^[a-zA-Z0-9]+;$/.test(tail)) end = amp;
+  // Apply until stable: each pass can expose new trailing punctuation
+  // (gfm-625 / 'https://example.com/x).': first pass keeps the ')'
+  // because '.' follows it, second pass drops the now-final ')').
+  let cur = s;
+  for (;;) {
+    const m = BACKPEDAL_RE.exec(cur);
+    const nxt = m ? m[0] : '';
+    if (nxt === cur) return nxt.length;
+    cur = nxt;
   }
-  let changed = true;
-  while (changed) {
-    changed = false;
-    while (end > 0 && trailPunct(s[end - 1])) { end--; changed = true; }
-    if (end > 0 && s[end - 1] === ')') {
-      // Protected when it closes a balanced group: scan back for the
-      // nearest '(' or ')'; '(' first (nothing between) means balanced.
-      let j = end - 2;
-      while (j >= 0 && s[j] !== '(' && s[j] !== ')') j--;
-      if (j < 0 || s[j] === ')') { end--; changed = true; }
-    }
-  }
-  return end;
 }
 
 // Apply extended autolinks to a segment list (recursively into children).
